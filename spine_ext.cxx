@@ -62,6 +62,12 @@
 
 #include "itkEllipseSpatialObject.h"
 
+#include "itkBinaryMorphologicalClosingImageFilter.h"
+#include "itkBinaryBallStructuringElement.h"
+
+#include "itkScalarImageToHistogramGenerator.h"
+#include <itkOtsuMultipleThresholdsCalculator.h>
+
 using PixelType = short;
 
 using ImageType = itk::Image< PixelType, 3 >;
@@ -84,7 +90,10 @@ typedef HoughTransformFilterType::CirclesListType CirclesListType;
 typedef itk::OtsuMultipleThresholdsImageFilter <ImageType2D, ImageType2D> OtsuFilterType2D;
 typedef itk::OtsuMultipleThresholdsImageFilter <ImageType, ImageType> OtsuFilterType;
 
+using ScalarImageToHistogramGeneratorType = itk::Statistics::ScalarImageToHistogramGenerator<ImageType>;
+using HistogramType = ScalarImageToHistogramGeneratorType::HistogramType;
 
+using CalculatorType = itk::OtsuMultipleThresholdsCalculator<HistogramType>;
 
 
 bool circle_itersect(double x1, double y1, double r1, double x2, double y2, double r2) {
@@ -764,8 +773,70 @@ void corrigate_circles_local(std::vector<CirclesListType> &circles_list1) {
 
 }
 
+ImageType::Pointer close_on_2d_slices(ImageType::Pointer input) {
+    std::cout << "Closing" << std::endl;
+    using StructuringElementType = itk::BinaryBallStructuringElement<ImageType::PixelType, ImageType::ImageDimension>;
+    StructuringElementType structuringElement;
+    structuringElement.SetRadius(1);
+    structuringElement.CreateStructuringElement();
+
+    using BinaryMorphologicalClosingImageFilterType =
+        itk::BinaryMorphologicalClosingImageFilter<ImageType, ImageType, StructuringElementType>;
+    BinaryMorphologicalClosingImageFilterType::Pointer closingFilter = BinaryMorphologicalClosingImageFilterType::New();
+    closingFilter->SetForegroundValue(1);
+    closingFilter->SetKernel(structuringElement);
+
+    using PasteFilterType = itk::PasteImageFilter<ImageType, ImageType>;
+    PasteFilterType::Pointer pasteFilter = PasteFilterType::New();
+
+    const ImageType * inputImage = input;
+
+    ImageType::RegionType inputRegion = inputImage->GetBufferedRegion();
+    ImageType::SizeType size = inputRegion.GetSize();
+    int height_of_the_image;
+    height_of_the_image = size[2];
+    using ExtractFilterType = itk::ExtractImageFilter< ImageType, ImageType >;
+
+    pasteFilter->SetDestinationImage(inputImage);
+    for (int i = 1; i < height_of_the_image; i++) {
+
+        ExtractFilterType::Pointer extractFilter = ExtractFilterType::New();
+        extractFilter->SetDirectionCollapseToSubmatrix();
+
+        size[2] = 1; // we extract along z direction
+
+        ImageType::IndexType start = inputRegion.GetIndex();
+
+        start[2] = i;
+        ImageType::RegionType desiredRegion;
+        desiredRegion.SetSize(size);
+        desiredRegion.SetIndex(start);
+        extractFilter->SetExtractionRegion(desiredRegion);;
+        extractFilter->SetInput(inputImage);
+
+        closingFilter->SetInput(extractFilter->GetOutput());
+        pasteFilter->SetSourceImage(closingFilter->GetOutput());
+
+        ImageType::SizeType indexRadius;
+        indexRadius[0] = 1; // radius along x
+        indexRadius[1] = 1; // radius along y
+        indexRadius[2] = 0; // radius along z
+        closingFilter->SetRadius(indexRadius);
+        closingFilter->UpdateLargestPossibleRegion();
+        closingFilter->Update();
+        const ImageType * closingImage = closingFilter->GetOutput();
+        pasteFilter->SetSourceRegion(closingImage->GetBufferedRegion());
+        pasteFilter->SetDestinationIndex(start);
+
+        pasteFilter->Update();
+        pasteFilter->SetDestinationImage(pasteFilter->GetOutput());
+    }
+    std::cout << "Closing end" << std::endl;
+    return pasteFilter->GetOutput();
+}
+
 template<class MyType>
-void normalize(MyType input) {
+void normalize_old(MyType input) {
     ImageType::IndexType index3d;
     for (int x = 0; x < input->GetOutput()->GetBufferedRegion().GetSize()[0]; x++) {
         for (int y = 0; y < input->GetOutput()->GetBufferedRegion().GetSize()[1]; y++) {
@@ -787,9 +858,53 @@ void normalize(MyType input) {
     }
 }
 
+ScalarImageToHistogramGeneratorType::Pointer normalize(ImageType::Pointer input) {
+
+    ScalarImageToHistogramGeneratorType::Pointer scalarImageToHistogramGenerator = ScalarImageToHistogramGeneratorType::New();
+
+    scalarImageToHistogramGenerator->SetHistogramMin(0);
+    scalarImageToHistogramGenerator->SetHistogramMax(1000);
+    scalarImageToHistogramGenerator->SetNumberOfBins(50);
+    scalarImageToHistogramGenerator->SetAutoHistogramMinimumMaximum(false);
+    scalarImageToHistogramGenerator->SetInput(input);
+    scalarImageToHistogramGenerator->Compute();
+
+    return scalarImageToHistogramGenerator;
+  
+}
+
+
+CalculatorType::OutputType otusHist(ScalarImageToHistogramGeneratorType::Pointer input) {
+
+    //OtsuFilterType::Pointer otsuFilter = OtsuFilterType::New();
+    CalculatorType::Pointer otsuFilter = CalculatorType::New();
+    //otsuFilter->SetInput(reader_original->GetOutput());
+    otsuFilter->SetInputHistogram(input->GetOutput());
+    otsuFilter->SetNumberOfThresholds(1);
+    otsuFilter->Update(); // To compute threshold
+
+                          //OtsuFilterType::ThresholdVectorType thresholds = otsuFilter->GetThresholds();
+    const CalculatorType::OutputType & thresholds = otsuFilter->GetOutput();
+    return thresholds;
+}
+
+OtsuFilterType::ThresholdVectorType otusImg(ReaderType::Pointer input) {
+
+    OtsuFilterType::Pointer otsuFilter = OtsuFilterType::New();
+    otsuFilter->SetInput(input->GetOutput());
+    otsuFilter->SetNumberOfThresholds(1);
+    otsuFilter->Update(); // To compute threshold
+
+    OtsuFilterType::ThresholdVectorType thresholds = otsuFilter->GetThresholds();
+    return thresholds;
+}
+
 //std::string files[] = { "test\\0verse112.nii.gz", "test\\1AnyScan.nii.gz", "test\\2LA_LD_02.nii.gz", "test\\3LA_1.nii.gz", "test\\4LUNG_PET.nii.gz", "test\\5LungRT.nii.gz", "test\\6LA_Diagn_1.nii.gz", "test\\7LA_Diagn_3.nii.gz", "test\\8LA_LD_01.nii.gz", "test\\9LungPhilips.nii.gz" };
 //std::string files[] = { "test\\2LA_LD_02.nii.gz" };
 //std::string files[] = { "test\\0verse112.nii.gz" };
+
+
+//std::string files[] = { "bigtest\\lung_08.nii.gz" };
 
 int main(int argc, char ** argv)
 {
@@ -798,7 +913,7 @@ int main(int argc, char ** argv)
     for (int i = 1; i <= 60; i++) {
         if (i > 9) {
             files.push_back("bigtest\\lung_" + std::to_string(i) + ".nii.gz");
-
+    
         }
         else {
             files.push_back("bigtest\\lung_0" + std::to_string(i) + ".nii.gz");
@@ -885,9 +1000,9 @@ int main(int argc, char ** argv)
             return EXIT_FAILURE;
         }
 
-        normalize<ReaderType::Pointer>(reader_original);
-        normalize<ReaderType::Pointer>(reader_original_1);
-        normalize<ReaderType::Pointer>(reader_original_2);
+        ScalarImageToHistogramGeneratorType::Pointer a = normalize(reader_original->GetOutput());
+        ScalarImageToHistogramGeneratorType::Pointer b = normalize(reader_original_1->GetOutput());
+        ScalarImageToHistogramGeneratorType::Pointer c = normalize(reader_original_2->GetOutput());
 
         // set up the extraction region [one slice]
     
@@ -895,12 +1010,13 @@ int main(int argc, char ** argv)
 
         std::cout << "Thresholding" << std::endl;
 
-        OtsuFilterType::Pointer otsuFilter = OtsuFilterType::New();
-        otsuFilter->SetInput(reader_original->GetOutput());
-        otsuFilter->SetNumberOfThresholds(4);
-        otsuFilter->Update(); // To compute threshold
+        //OtsuFilterType::Pointer otsuFilter = OtsuFilterType::New();
+        //otsuFilter->SetInput(reader_original->GetOutput());
+        //otsuFilter->SetNumberOfThresholds(4);
+        //otsuFilter->Update(); // To compute threshold
 
-        OtsuFilterType::ThresholdVectorType thresholds = otsuFilter->GetThresholds();
+        //OtsuFilterType::ThresholdVectorType thresholds = otsuFilter->GetThresholds();
+        const CalculatorType::OutputType & thresholds = otusHist(a);
         for (unsigned int i = 0; i < thresholds.size(); i++)
         {
             std::cout << thresholds[i] << std::endl;
@@ -909,20 +1025,22 @@ int main(int argc, char ** argv)
         using FilterType = itk::BinaryThresholdImageFilter< ImageType, ImageType >;
         FilterType::Pointer threshFilter = FilterType::New();
         threshFilter->SetInput(reader_original->GetOutput());
-        if (thresholds[3] > 1000) {
-            threshFilter->SetLowerThreshold(thresholds[2]);
-        }
-        else {
-            threshFilter->SetLowerThreshold(thresholds[3]);
-        }
+        //if (thresholds[3] > 1000) {
+        //    threshFilter->SetLowerThreshold(thresholds[2]);
+        //}
+        //else {
+        //    threshFilter->SetLowerThreshold(thresholds[3]);
+        //}
+        threshFilter->SetLowerThreshold(thresholds[0]);
         threshFilter->SetUpperThreshold(10000);
         threshFilter->SetOutsideValue(0);
         threshFilter->SetInsideValue(1);
         threshFilter->Update();
 
+        // CLOSING
+        const ImageType::Pointer inputImage = close_on_2d_slices(threshFilter->GetOutput());
+        //const ImageType * inputImage = threshFilter->GetOutput();
 
-        const ImageType * inputImage = threshFilter->GetOutput();
-    
         ImageType::RegionType inputRegion = inputImage->GetBufferedRegion();
         ImageType::SizeType size = inputRegion.GetSize();
         int height_of_the_image;
